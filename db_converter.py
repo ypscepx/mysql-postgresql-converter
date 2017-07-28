@@ -28,7 +28,8 @@ def parse(input_filename, output_filename):
     creation_lines = []
     enum_types = []
     foreign_key_lines = []
-    fulltext_key_lines = []
+    index_lines = []
+    drop_index_lines = []
     sequence_lines = []
     cast_lines = []
     num_inserts = 0
@@ -69,7 +70,7 @@ def parse(input_filename, output_filename):
             secs_left % 60,
         ))
         logging.flush()
-        line = line.decode("utf8").strip().replace(r"\\", "WUBWUBREALSLASHWUB").replace(r"\'", "''").replace("WUBWUBREALSLASHWUB", r"\\")
+        line = line.decode("utf8").strip().replace(r"\\", "WUBWUBREALSLASHWUB").replace(r"\0", "").replace(r"\'", "''").replace("WUBWUBREALSLASHWUB", r"\\")
         # Ignore comment lines
         if line.startswith("--") or line.startswith("/*") or line.startswith("LOCK TABLES") or line.startswith("DROP TABLE") or line.startswith("UNLOCK TABLES") or not line:
             continue
@@ -83,7 +84,7 @@ def parse(input_filename, output_filename):
                 creation_lines = []
             # Inserting data into a table?
             elif line.startswith("INSERT INTO"):
-                output.write(line.encode("utf8").replace("'0000-00-00 00:00:00'", "NULL") + "\n")
+                output.write(re.sub(r"([^'])'0000-00-00 00:00:00'", r"\1NULL", line.encode("utf8")) + "\n")
                 num_inserts += 1
             # ???
             else:
@@ -109,11 +110,18 @@ def parse(input_filename, output_filename):
 
                 # See if it needs type conversion
                 final_type = None
+                final_default = None
                 set_sequence = None
                 if type == "tinyint(1)":
                     type = "int4"
                     set_sequence = True
                     final_type = "boolean"
+
+                    if "DEFAULT '0'" in extra:
+                        final_default = "FALSE"
+                    elif "DEFAULT '1'" in extra:
+                        final_default = "TRUE"
+
                 elif type.startswith("int("):
                     type = "integer"
                     set_sequence = True
@@ -134,6 +142,7 @@ def parse(input_filename, output_filename):
                     set_sequence = True
                 elif type == "datetime":
                     type = "timestamp with time zone"
+                    extra = extra.replace("NOT NULL", "")
                 elif type == "double":
                     type = "double precision"
                 elif type == "blob":
@@ -154,9 +163,13 @@ def parse(input_filename, output_filename):
                     type = enum_name
 
                 if final_type:
-                    cast_lines.append("ALTER TABLE \"%s\" ALTER COLUMN \"%s\" DROP DEFAULT, ALTER COLUMN \"%s\" TYPE %s USING CAST(\"%s\" as %s)" % (current_table, name, name, final_type, name, final_type))
+                    cast_lines.append("ALTER TABLE \"%s\" ALTER COLUMN \"%s\" DROP DEFAULT" % (current_table, name))
+                    cast_lines.append("ALTER TABLE \"%s\" ALTER COLUMN \"%s\" TYPE %s USING CAST(\"%s\" as %s)" % (current_table, name, final_type, name, final_type))
+                    if final_default:
+                        cast_lines.append("ALTER TABLE \"%s\" ALTER COLUMN \"%s\" SET DEFAULT %s" % (current_table, name, final_default))
                 # ID fields need sequences [if they are integers?]
                 if name == "id" and set_sequence is True:
+                    sequence_lines.append("DROP SEQUENCE IF EXISTS %s_id_seq" % (current_table))
                     sequence_lines.append("CREATE SEQUENCE %s_id_seq" % (current_table))
                     sequence_lines.append("SELECT setval('%s_id_seq', max(id)) FROM %s" % (current_table, current_table))
                     sequence_lines.append("ALTER TABLE \"%s\" ALTER COLUMN \"id\" SET DEFAULT nextval('%s_id_seq')" % (current_table, current_table))
@@ -169,17 +182,28 @@ def parse(input_filename, output_filename):
             elif line.startswith("CONSTRAINT"):
                 foreign_key_lines.append("ALTER TABLE \"%s\" ADD CONSTRAINT %s DEFERRABLE INITIALLY DEFERRED" % (current_table, line.split("CONSTRAINT")[1].strip().rstrip(",")))
                 foreign_key_lines.append("CREATE INDEX ON \"%s\" %s" % (current_table, line.split("FOREIGN KEY")[1].split("REFERENCES")[0].strip().rstrip(",")))
+            elif line.startswith("UNIQUE KEY \""):
+                index_name      = line.split('"')[1].split('"')[0]
+                index_columns   = line.split("(")[1].split(")")[0]
+                index_lines.append("CREATE UNIQUE INDEX \"%s\" ON %s (%s)" % (index_name, current_table, index_columns))
+                drop_index_lines.append("DROP INDEX IF EXISTS \"%s\"" % index_name)
             elif line.startswith("UNIQUE KEY"):
-                creation_lines.append("UNIQUE (%s)" % line.split("(")[1].split(")")[0])
-            elif line.startswith("FULLTEXT KEY"):
-
-                fulltext_keys = " || ' ' || ".join( line.split('(')[-1].split(')')[0].replace('"', '').split(',') )
-                fulltext_key_lines.append("CREATE INDEX ON %s USING gin(to_tsvector('english', %s))" % (current_table, fulltext_keys))
-
+                index_columns   = line.split("(")[1].split(")")[0]
+                index_lines.append("CREATE UNIQUE INDEX ON %s (%s)" % (current_table, index_columns))
+            elif line.startswith("KEY \""):
+                index_name      = line.split('"')[1].split('"')[0]
+                index_columns   = line.split("(")[1].split(")")[0]
+                index_lines.append("CREATE INDEX \"%s\" ON %s (%s)" % (index_name, current_table, index_columns))
+                drop_index_lines.append("DROP INDEX IF EXISTS \"%s\"" % index_name)
             elif line.startswith("KEY"):
-                pass
+                index_columns = line.split("(")[1].split(")")[0]
+                index_lines.append("CREATE INDEX ON %s (%s)" % (current_table, index_columns))
+            elif line.startswith("FULLTEXT KEY"):
+                fulltext_keys = " || ' ' || ".join( line.split('(')[-1].split(')')[0].replace('"', '').split(',') )
+                index_lines.append("CREATE INDEX ON %s USING gin(to_tsvector('english', %s))" % (current_table, fulltext_keys))
             # Is it the end of the table?
             elif line == ");":
+                output.write("DROP TABLE IF EXISTS \"%s\";\n" % current_table)
                 output.write("CREATE TABLE \"%s\" (\n" % current_table)
                 for i, line in enumerate(creation_lines):
                     output.write("    %s%s\n" % (line, "," if i != (len(creation_lines) - 1) else ""))
@@ -210,9 +234,16 @@ def parse(input_filename, output_filename):
     for line in sequence_lines:
         output.write("%s;\n" % line)
 
-    # Write full-text indexkeyses out
-    output.write("\n-- Full Text keys --\n")
-    for line in fulltext_key_lines:
+    # This line is an anchor for move_drop_indexes.ed
+    output.write("\n-- Drop indexes --\n")
+    for line in drop_index_lines:
+        output.write("%s;\n" % line)
+    # This line is an anchor for move_drop_indexes.ed
+    output.write("-- END Drop indexes --\n")
+
+    # Write indexes out
+    output.write("\n-- Indexes --\n")
+    for line in index_lines:
         output.write("%s;\n" % line)
 
     # Finish file
